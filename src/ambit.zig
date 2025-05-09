@@ -11,12 +11,26 @@ const argCount = 8;
 
 const AmbiBuiltin = *const fn (vm: *VM, args: [8]u16) u16;
 
+fn bytesToUsize(bytes: []const u8) usize {
+    var result: usize = 0;
+
+    for (bytes, 0..) |b, i| {
+        result |= @intCast(b);
+        // can't use <<= because of issues with how it works with runtime-known values
+        // see https://ziggit.dev/t/cannot-cast-usize-to-i64-in-std-math-pow/6518
+        // and https://github.com/ziglang/zig/issues/7605
+        result = std.math.shr(usize, result, 8 * (i + 1));
+    }
+
+    return result;
+}
+
 pub const Scope = struct {
     parent: ?*Scope,
-    raddress: usize,
+    raddress: ?usize,
     memory: *[memorySize]u8,
     args: [argCount]u16,
-    pub fn init(parent: ?*Scope, raddress: usize, args: [argCount]u16) Scope {
+    pub fn init(parent: ?*Scope, raddress: ?usize, args: [argCount]u16) Scope {
         var memory = [_]u8{0} ** memorySize;
         return .{ .parent = parent, .raddress = raddress, .memory = if (parent) |p| p.memory else &memory, .args = args };
     }
@@ -61,7 +75,7 @@ pub const VM = struct {
         } else if (register >= 32 and register <= 39) {
             return self.scope.args[@intCast(register - 31)];
         } else {
-            try self.errf(AmbitError.General, "{d} is not a writable register", .{register});
+            try self.errf(AmbitError.General, "{d} is not a readable register", .{register});
         }
 
         unreachable;
@@ -84,10 +98,39 @@ pub const VM = struct {
             switch (op) {
                 .Call => {
                     const state = bytes[self.pc + 1];
-                    if (state == 1 or state == 2) {} else {}
+
+                    if (state == 1) {} else {
+                        const target = bytesToUsize(bytes[self.pc + 1 .. 2]);
+                        const rr = bytes[self.pc + 3];
+
+                        const targetOp: Opcode = @enumFromInt(bytes[target]);
+                        if (targetOp != Opcode.Scope) {
+                            try self.errf(AmbitError.InvalidCallAddress, "{d} is not a valid calling address, as all calls must be to a scope instruction", .{target});
+                        }
+
+                        var subvm = VM.initWithScope(self.allocator, Scope.init(&self.scope, self.pc + 4, self.passedArgs));
+                        try self.setRegister(rr, try subvm.execute(bytes[target..]));
+
+                        self.pc += 1;
+                    }
                 },
-                .Scope => self.pc += 1,
-                .Abort => self.pc += 1,
+                .Scope => {
+                    const subsc = Scope.init(&self.scope, null, self.passedArgs);
+                    self.scope = subsc;
+
+                    self.pc += 1;
+                },
+                .Abort => {
+                    if (self.scope.parent != null) {
+                        if (self.scope.raddress) |ra| {
+                            self.pc = ra;
+                        }
+
+                        self.scope = self.scope.parent.?.*;
+                    }
+
+                    self.pc += 1;
+                },
                 .Mget => self.pc += 1,
                 .Mset => self.pc += 1,
                 .Cmp => self.pc += 1,
